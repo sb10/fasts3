@@ -5,10 +5,13 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,6 +21,12 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/mitchellh/go-homedir"
+)
+
+const (
+	defaultS3Domain       = "s3.amazonaws.com"
+	maxKeys         int32 = 1000
+	parallelBase          = 4
 )
 
 func main() {
@@ -39,8 +48,9 @@ func main() {
 	}
 
 	jobs := []listJob{
-		{Name: "Minio", Fn: func() error { return accessor.ListEntriesMinio(accessor.basePath) }},
+		// {Name: "Minio", Fn: func() error { return accessor.ListEntriesMinio(accessor.basePath) }},
 		{Name: "AWS", Fn: func() error { return accessor.ListEntriesAWS(accessor.basePath) }},
+		{Name: "AWS SubDirs", Fn: func() error { return accessor.ListEntriesAWSParallelSubDirs(accessor.basePath) }},
 	}
 
 	rand.Shuffle(len(jobs), func(i, j int) { jobs[i], jobs[j] = jobs[j], jobs[i] })
@@ -60,13 +70,10 @@ func main() {
 		order[jb.Name] = i + 1
 	}
 
-	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s (run order: %d)\n", times["Minio"], order["Minio"])
+	// fmt.Fprintf(os.Stderr, "Minio Listing completed in %s (run order: %d)\n", times["Minio"], order["Minio"])
 	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s (run order: %d)\n", times["AWS"], order["AWS"])
+	fmt.Fprintf(os.Stderr, "AWS SDK SubDirs Listing completed in %s (run order: %d)\n", times["AWS SubDirs"], order["AWS SubDirs"])
 }
-
-const (
-	defaultS3Domain = "s3.amazonaws.com"
-)
 
 // S3Config struct lets you provide details of the S3 bucket you wish to mount.
 // If you have Amazon's s3cmd or other tools configured to work using config
@@ -241,6 +248,7 @@ type S3Accessor struct {
 	target      string
 	host        string
 	basePath    string
+	parallelism int
 }
 
 // NewS3Accessor creates an S3Accessor for interacting with S3-like object
@@ -276,10 +284,11 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 	}
 
 	a := &S3Accessor{
-		target:   config.Target,
-		bucket:   bucket,
-		host:     host,
-		basePath: basePath,
+		target:      config.Target,
+		bucket:      bucket,
+		host:        host,
+		basePath:    basePath,
+		parallelism: max(runtime.NumCPU()*parallelBase, parallelBase),
 	}
 
 	// create a minio client for interacting with S3 (we do this here instead of
@@ -296,6 +305,14 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Tune HTTP transport for better connection reuse and parallel throughput
+	tr := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 200,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	cfg.HTTPClient = &http.Client{Transport: tr, Timeout: 0}
 
 	// create an aws client
 	var awsClient *s3.Client
@@ -327,7 +344,7 @@ func (a *S3Accessor) ListEntriesMinio(dir string) error {
 	oiCh := a.minioClient.ListObjects(ctx, a.bucket, minio.ListObjectsOptions{
 		Prefix:    dir,
 		Recursive: true,
-		// MaxKeys:   10000,
+		MaxKeys:   int(maxKeys),
 	})
 
 	for oi := range oiCh {
@@ -347,8 +364,9 @@ func (a *S3Accessor) ListEntriesMinio(dir string) error {
 // given directory using the aws-sdk-go-v2 library.
 func (a *S3Accessor) ListEntriesAWS(dir string) error {
 	paginator := s3.NewListObjectsV2Paginator(a.awsClient, &s3.ListObjectsV2Input{
-		Bucket: aws.String(a.bucket),
-		Prefix: aws.String(dir),
+		Bucket:  aws.String(a.bucket),
+		Prefix:  aws.String(dir),
+		MaxKeys: aws.Int32(maxKeys),
 	})
 
 	ctx := context.Background()
@@ -357,6 +375,7 @@ func (a *S3Accessor) ListEntriesAWS(dir string) error {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "err: %v\n", err)
+
 			continue
 		}
 
@@ -368,6 +387,103 @@ func (a *S3Accessor) ListEntriesAWS(dir string) error {
 			fmt.Fprintf(os.Stdout, "%s\t%d\n", *obj.Key, obj.Size)
 		}
 	}
+
+	return nil
+}
+
+// ListEntriesAWSParallelSubDirs lists immediate subdirectories (using
+// delimiter "/") under dir and then lists each subdirectory recursively in
+// parallel. Objects directly under dir are printed synchronously.
+func (a *S3Accessor) ListEntriesAWSParallelSubDirs(dir string) error {
+	ctx := context.Background()
+
+	// first get immediate subdirectories
+	paginator := s3.NewListObjectsV2Paginator(a.awsClient, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(a.bucket),
+		Prefix:    aws.String(dir),
+		Delimiter: aws.String("/"),
+		MaxKeys:   aws.Int32(maxKeys),
+	})
+
+	var subdirs []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "err: %v\n", err)
+
+			continue
+		}
+
+		// print objects directly under dir
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+
+			fmt.Fprintf(os.Stdout, "%s\t%d\n", *obj.Key, obj.Size)
+		}
+
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix != nil {
+				subdirs = append(subdirs, *cp.Prefix)
+			}
+		}
+	}
+
+	// list each subdir in parallel (recursive listing per subdir)
+	return a.parallelize(ctx, subdirs, func(ctx context.Context, sd string) error {
+		p := s3.NewListObjectsV2Paginator(a.awsClient, &s3.ListObjectsV2Input{
+			Bucket:  aws.String(a.bucket),
+			Prefix:  aws.String(sd),
+			MaxKeys: aws.Int32(maxKeys),
+		})
+
+		for p.HasMorePages() {
+			page, err := p.NextPage(ctx)
+			if err != nil {
+				return err
+			}
+
+			for _, obj := range page.Contents {
+				if obj.Key == nil {
+					continue
+				}
+
+				fmt.Fprintf(os.Stdout, "%s\t%d\n", *obj.Key, obj.Size)
+			}
+		}
+		return nil
+	})
+}
+
+// parallelize runs the provided work function for each prefix in parallel with
+// a bounded number of workers defined by `a.parallelism`. Work errors are
+// reported to stderr but do not stop other workers.
+func (a *S3Accessor) parallelize(ctx context.Context, prefixes []string, work func(context.Context, string) error) error {
+	wg := sync.WaitGroup{}
+	jobs := make(chan string)
+
+	worker := func() {
+		defer wg.Done()
+
+		for p := range jobs {
+			if err := work(ctx, p); err != nil {
+				fmt.Fprintf(os.Stderr, "err: %v\n", err)
+			}
+		}
+	}
+
+	for range a.parallelism {
+		wg.Add(1)
+		go worker()
+	}
+
+	for _, p := range prefixes {
+		jobs <- p
+	}
+	close(jobs)
+
+	wg.Wait()
 
 	return nil
 }
