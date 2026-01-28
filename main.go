@@ -46,8 +46,9 @@ func main() {
 	rand.Shuffle(len(jobs), func(i, j int) { jobs[i], jobs[j] = jobs[j], jobs[i] })
 
 	times := make(map[string]time.Duration)
+	order := make(map[string]int)
 
-	for _, jb := range jobs {
+	for i, jb := range jobs {
 		s := time.Now()
 
 		if err := jb.Fn(); err != nil {
@@ -56,10 +57,11 @@ func main() {
 		}
 
 		times[jb.Name] = time.Since(s)
+		order[jb.Name] = i + 1
 	}
 
-	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s\n", times["Minio"])
-	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s\n", times["AWS"])
+	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s (run order: %d)\n", times["Minio"], order["Minio"])
+	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s (run order: %d)\n", times["AWS"], order["AWS"])
 }
 
 const (
@@ -330,12 +332,12 @@ func (a *S3Accessor) ListEntriesMinio(dir string) error {
 
 	for oi := range oiCh {
 		if oi.Err != nil {
-			fmt.Printf("err: %v\n", oi.Err)
+			fmt.Fprintf(os.Stderr, "err: %v\n", oi.Err)
 
 			continue
 		}
 
-		fmt.Printf("%s\t%d\n", oi.Key, oi.Size)
+		fmt.Fprintf(os.Stdout, "%s\t%d\n", oi.Key, oi.Size)
 	}
 
 	return nil
@@ -354,7 +356,7 @@ func (a *S3Accessor) ListEntriesAWS(dir string) error {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			fmt.Printf("err: %v\n", err)
+			fmt.Fprintf(os.Stderr, "err: %v\n", err)
 			continue
 		}
 
@@ -363,7 +365,7 @@ func (a *S3Accessor) ListEntriesAWS(dir string) error {
 				continue
 			}
 
-			fmt.Printf("%s\t%d\n", *obj.Key, obj.Size)
+			fmt.Fprintf(os.Stdout, "%s\t%d\n", *obj.Key, obj.Size)
 		}
 	}
 
