@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-ini/ini"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -37,7 +40,16 @@ func main() {
 	}
 	elapsed1 := time.Since(s)
 
+	s = time.Now()
+	err = accessor.ListEntriesAWS(accessor.basePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing entries: %v\n", err)
+		os.Exit(1)
+	}
+	elapsed2 := time.Since(s)
+
 	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s\n", elapsed1)
+	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s\n", elapsed2)
 }
 
 const (
@@ -211,11 +223,12 @@ func S3ConfigFromEnvironment(profile, path string) (*S3Config, error) {
 
 // S3Accessor implements the RemoteAccessor interface by embedding minio-go.
 type S3Accessor struct {
-	client   *minio.Client
-	bucket   string
-	target   string
-	host     string
-	basePath string
+	minioClient *minio.Client
+	awsClient   *s3.Client
+	bucket      string
+	target      string
+	host        string
+	basePath    string
 }
 
 // NewS3Accessor creates an S3Accessor for interacting with S3-like object
@@ -257,13 +270,38 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 		basePath: basePath,
 	}
 
-	// create a client for interacting with S3 (we do this here instead of
+	// create a minio client for interacting with S3 (we do this here instead of
 	// as-needed inside remote because there's large overhead in creating these)
-	a.client, err = minio.New(host, &minio.Options{
+	a.minioClient, err = minio.New(host, &minio.Options{
 		Creds:  credentials.NewStaticV4(config.AccessKey, config.SecretKey, ""),
 		Region: config.Region,
 		Secure: secure,
 	})
+
+	ctx := context.Background()
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// create an aws client
+	var awsClient *s3.Client
+	if a.host != "" && a.host != defaultS3Domain {
+		u, err := url.Parse(a.target)
+		if err != nil {
+			return nil, err
+		}
+
+		endpointURL := fmt.Sprintf("%s://%s", u.Scheme, a.host)
+		awsClient = s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.EndpointResolver = s3.EndpointResolverFromURL(endpointURL)
+		})
+	} else {
+		awsClient = s3.NewFromConfig(cfg)
+	}
+
+	a.awsClient = awsClient
 
 	return a, err
 }
@@ -274,7 +312,7 @@ func (a *S3Accessor) ListEntriesMinio(dir string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	oiCh := a.client.ListObjects(ctx, a.bucket, minio.ListObjectsOptions{
+	oiCh := a.minioClient.ListObjects(ctx, a.bucket, minio.ListObjectsOptions{
 		Prefix:    dir,
 		Recursive: true,
 		// MaxKeys:   10000,
@@ -288,6 +326,35 @@ func (a *S3Accessor) ListEntriesMinio(dir string) error {
 		}
 
 		fmt.Printf("%s\t%d\n", oi.Key, oi.Size)
+	}
+
+	return nil
+}
+
+// ListEntriesAWS recursively lists all entries and their sizes under the
+// given directory using the aws-sdk-go-v2 library.
+func (a *S3Accessor) ListEntriesAWS(dir string) error {
+	paginator := s3.NewListObjectsV2Paginator(a.awsClient, &s3.ListObjectsV2Input{
+		Bucket: aws.String(a.bucket),
+		Prefix: aws.String(dir),
+	})
+
+	ctx := context.Background()
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			fmt.Printf("err: %v\n", err)
+			continue
+		}
+
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+
+			fmt.Printf("%s\t%d\n", *obj.Key, obj.Size)
+		}
 	}
 
 	return nil
