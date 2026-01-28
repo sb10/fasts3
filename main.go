@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"path"
@@ -32,24 +33,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	s := time.Now()
-	err = accessor.ListEntriesMinio(accessor.basePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing entries: %v\n", err)
-		os.Exit(1)
+	type listJob struct {
+		Name string
+		Fn   func() error
 	}
-	elapsed1 := time.Since(s)
 
-	s = time.Now()
-	err = accessor.ListEntriesAWS(accessor.basePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing entries: %v\n", err)
-		os.Exit(1)
+	jobs := []listJob{
+		{Name: "Minio", Fn: func() error { return accessor.ListEntriesMinio(accessor.basePath) }},
+		{Name: "AWS", Fn: func() error { return accessor.ListEntriesAWS(accessor.basePath) }},
 	}
-	elapsed2 := time.Since(s)
 
-	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s\n", elapsed1)
-	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s\n", elapsed2)
+	rand.Shuffle(len(jobs), func(i, j int) { jobs[i], jobs[j] = jobs[j], jobs[i] })
+
+	times := make(map[string]time.Duration)
+
+	for _, jb := range jobs {
+		s := time.Now()
+
+		if err := jb.Fn(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error listing entries (%s): %v\n", jb.Name, err)
+			os.Exit(1)
+		}
+
+		times[jb.Name] = time.Since(s)
+	}
+
+	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s\n", times["Minio"])
+	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s\n", times["AWS"])
 }
 
 const (
@@ -295,7 +305,7 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 
 		endpointURL := fmt.Sprintf("%s://%s", u.Scheme, a.host)
 		awsClient = s3.NewFromConfig(cfg, func(o *s3.Options) {
-			o.EndpointResolver = s3.EndpointResolverFromURL(endpointURL)
+			o.BaseEndpoint = aws.String(endpointURL)
 		})
 	} else {
 		awsClient = s3.NewFromConfig(cfg)
