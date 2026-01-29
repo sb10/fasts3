@@ -30,11 +30,19 @@ const (
 )
 
 func main() {
-	config, err := S3ConfigFromEnvironment("", os.Args[1])
+	bench, pathArg, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--benchmark] <bucket/path>\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	config, err := S3ConfigFromEnvironment("", pathArg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading S3 config: %v\n", err)
 		os.Exit(1)
 	}
+
+	config.PrintStdout = !bench
 
 	accessor, err := NewS3Accessor(config)
 	if err != nil {
@@ -42,13 +50,57 @@ func main() {
 		os.Exit(1)
 	}
 
+	if bench {
+		benchmark(accessor)
+
+		return
+	}
+
+	s := time.Now()
+	if err := accessor.ListEntriesAWS(accessor.basePath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing entries (AWS): %v\n", err)
+		os.Exit(1)
+	}
+
+	accessor.Close()
+
+	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s\n", time.Since(s))
+}
+
+// parseArgs parses CLI arguments and returns (benchmarkFlag, pathArg, error).
+// Accepts an optional `--benchmark` flag and a required path argument.
+func parseArgs(args []string) (bool, string, error) {
+	if len(args) == 0 {
+		return false, "", fmt.Errorf("no args")
+	}
+
+	bench := false
+	var pathArg string
+	for _, a := range args {
+		if a == "--benchmark" {
+			bench = true
+			continue
+		}
+		if pathArg == "" {
+			pathArg = a
+		}
+	}
+
+	if pathArg == "" {
+		return false, "", fmt.Errorf("missing path")
+	}
+
+	return bench, pathArg, nil
+}
+
+func benchmark(accessor *S3Accessor) {
 	type listJob struct {
 		Name string
 		Fn   func() error
 	}
 
 	jobs := []listJob{
-		// {Name: "Minio", Fn: func() error { return accessor.ListEntriesMinio(accessor.basePath) }},
+		{Name: "Minio", Fn: func() error { return accessor.ListEntriesMinio(accessor.basePath) }},
 		{Name: "AWS", Fn: func() error { return accessor.ListEntriesAWS(accessor.basePath) }},
 		{Name: "AWS SubDirs", Fn: func() error { return accessor.ListEntriesAWSParallelSubDirs(accessor.basePath) }},
 	}
@@ -70,7 +122,9 @@ func main() {
 		order[jb.Name] = i + 1
 	}
 
-	// fmt.Fprintf(os.Stderr, "Minio Listing completed in %s (run order: %d)\n", times["Minio"], order["Minio"])
+	accessor.Close()
+
+	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s (run order: %d)\n", times["Minio"], order["Minio"])
 	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s (run order: %d)\n", times["AWS"], order["AWS"])
 	fmt.Fprintf(os.Stderr, "AWS SDK SubDirs Listing completed in %s (run order: %d)\n", times["AWS SubDirs"], order["AWS SubDirs"])
 }
@@ -92,6 +146,10 @@ type S3Config struct {
 	// strings for access to a public bucket.
 	AccessKey string
 	SecretKey string
+	// PrintStdout controls whether listing functions emit entries to STDOUT.
+	// Set via FASTS3_PRINT_STDOUT environment variable (true unless
+	// explicitly set to "0"/"false").
+	PrintStdout bool
 }
 
 // S3ConfigFromEnvironment makes an S3Config with Target, AccessKey, SecretKey
@@ -232,11 +290,13 @@ func S3ConfigFromEnvironment(profile, path string) (*S3Config, error) {
 		region = os.Getenv("AWS_DEFAULT_REGION")
 	}
 
+	// printing is enabled by default; CLI `--benchmark` will disable it.
 	return &S3Config{
-		Target:    u.String(),
-		Region:    region,
-		AccessKey: key,
-		SecretKey: secret,
+		Target:      u.String(),
+		Region:      region,
+		AccessKey:   key,
+		SecretKey:   secret,
+		PrintStdout: true,
 	}, err
 }
 
@@ -249,6 +309,10 @@ type S3Accessor struct {
 	host        string
 	basePath    string
 	parallelism int
+	// printing support
+	outCh       chan string
+	outWg       sync.WaitGroup
+	printStdout bool
 }
 
 // NewS3Accessor creates an S3Accessor for interacting with S3-like object
@@ -289,6 +353,7 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 		host:        host,
 		basePath:    basePath,
 		parallelism: max(runtime.NumCPU()*parallelBase, parallelBase),
+		printStdout: config.PrintStdout,
 	}
 
 	// create a minio client for interacting with S3 (we do this here instead of
@@ -332,7 +397,56 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 
 	a.awsClient = awsClient
 
+	// start a single background buffered writer that coalesces writes to
+	// stdout when printing is enabled
+	if a.printStdout {
+		a.outCh = make(chan string, 1000)
+		a.outWg.Add(1)
+
+		go func() {
+			defer a.outWg.Done()
+
+			bw := bufio.NewWriter(os.Stdout)
+
+			for s := range a.outCh {
+				bw.WriteString(s)
+			}
+
+			bw.Flush()
+		}()
+	}
+
 	return a, err
+}
+
+// enqueueOutput sends a pre-formatted string to the background writer.
+func (a *S3Accessor) enqueueOutput(s string) {
+	if !a.printStdout || a.outCh == nil {
+		return
+	}
+
+	a.outCh <- s
+}
+
+// printEntry writes a single entry (key, size) to the buffered stdout writer.
+// It accepts a pointer to the size because AWS SDK returns a *int64 which may
+// be nil; a nil size is treated as 0.
+func (a *S3Accessor) printEntry(key string, sizePtr *int64) {
+	var size int64
+
+	if sizePtr != nil {
+		size = *sizePtr
+	}
+
+	a.enqueueOutput(fmt.Sprintf("%s\t%d\n", key, size))
+}
+
+// Close flushes any pending stdout output and stops the background writer.
+func (a *S3Accessor) Close() {
+	if a.printStdout && a.outCh != nil {
+		close(a.outCh)
+		a.outWg.Wait()
+	}
 }
 
 // ListEntriesMinio recursively lists all entries and their sizes under the
@@ -354,7 +468,9 @@ func (a *S3Accessor) ListEntriesMinio(dir string) error {
 			continue
 		}
 
-		fmt.Fprintf(os.Stdout, "%s\t%d\n", oi.Key, oi.Size)
+		// minio returns a concrete int64; take its address so the
+		// unified printEntry which expects *int64 can handle it.
+		a.printEntry(oi.Key, &oi.Size)
 	}
 
 	return nil
@@ -384,7 +500,7 @@ func (a *S3Accessor) ListEntriesAWS(dir string) error {
 				continue
 			}
 
-			fmt.Fprintf(os.Stdout, "%s\t%d\n", *obj.Key, obj.Size)
+			a.printEntry(*obj.Key, obj.Size)
 		}
 	}
 
@@ -420,7 +536,7 @@ func (a *S3Accessor) ListEntriesAWSParallelSubDirs(dir string) error {
 				continue
 			}
 
-			fmt.Fprintf(os.Stdout, "%s\t%d\n", *obj.Key, obj.Size)
+			a.printEntry(*obj.Key, obj.Size)
 		}
 
 		for _, cp := range page.CommonPrefixes {
@@ -449,7 +565,7 @@ func (a *S3Accessor) ListEntriesAWSParallelSubDirs(dir string) error {
 					continue
 				}
 
-				fmt.Fprintf(os.Stdout, "%s\t%d\n", *obj.Key, obj.Size)
+				a.printEntry(*obj.Key, obj.Size)
 			}
 		}
 		return nil
