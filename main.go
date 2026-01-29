@@ -57,14 +57,14 @@ func main() {
 	}
 
 	s := time.Now()
-	if err := accessor.ListEntriesAWS(accessor.basePath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing entries (AWS): %v\n", err)
+	if err := accessor.ListEntriesAWSParallelSubDirs(accessor.basePath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing entries: %v\n", err)
 		os.Exit(1)
 	}
 
 	accessor.Close()
 
-	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s\n", time.Since(s))
+	fmt.Fprintf(os.Stderr, "Listing completed in %s\n", time.Since(s))
 }
 
 // parseArgs parses CLI arguments and returns (benchmarkFlag, pathArg, error).
