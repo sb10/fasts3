@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -57,7 +58,7 @@ func main() {
 	}
 
 	s := time.Now()
-	if err := accessor.ListEntriesAWSParallelSubDirs(accessor.basePath); err != nil {
+	if err := accessor.ListEntriesMinioParallelSubDirs(accessor.basePath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing entries: %v\n", err)
 		os.Exit(1)
 	}
@@ -101,6 +102,7 @@ func benchmark(accessor *S3Accessor) {
 
 	jobs := []listJob{
 		{Name: "Minio", Fn: func() error { return accessor.ListEntriesMinio(accessor.basePath) }},
+		{Name: "Minio SubDirs", Fn: func() error { return accessor.ListEntriesMinioParallelSubDirs(accessor.basePath) }},
 		{Name: "AWS", Fn: func() error { return accessor.ListEntriesAWS(accessor.basePath) }},
 		{Name: "AWS SubDirs", Fn: func() error { return accessor.ListEntriesAWSParallelSubDirs(accessor.basePath) }},
 	}
@@ -109,8 +111,11 @@ func benchmark(accessor *S3Accessor) {
 
 	times := make(map[string]time.Duration)
 	order := make(map[string]int)
+	counts := make(map[string]int64)
 
 	for i, jb := range jobs {
+		accessor.ResetFileCount()
+
 		s := time.Now()
 
 		if err := jb.Fn(); err != nil {
@@ -120,13 +125,15 @@ func benchmark(accessor *S3Accessor) {
 
 		times[jb.Name] = time.Since(s)
 		order[jb.Name] = i + 1
+		counts[jb.Name] = accessor.FileCount()
 	}
 
 	accessor.Close()
 
-	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s (run order: %d)\n", times["Minio"], order["Minio"])
-	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s (run order: %d)\n", times["AWS"], order["AWS"])
-	fmt.Fprintf(os.Stderr, "AWS SDK SubDirs Listing completed in %s (run order: %d)\n", times["AWS SubDirs"], order["AWS SubDirs"])
+	fmt.Fprintf(os.Stderr, "Minio Listing completed in %s (run order: %d, files: %d)\n", times["Minio"], order["Minio"], counts["Minio"])
+	fmt.Fprintf(os.Stderr, "Minio SubDirs Listing completed in %s (run order: %d, files: %d)\n", times["Minio SubDirs"], order["Minio SubDirs"], counts["Minio SubDirs"])
+	fmt.Fprintf(os.Stderr, "AWS SDK Listing completed in %s (run order: %d, files: %d)\n", times["AWS"], order["AWS"], counts["AWS"])
+	fmt.Fprintf(os.Stderr, "AWS SDK SubDirs Listing completed in %s (run order: %d, files: %d)\n", times["AWS SubDirs"], order["AWS SubDirs"], counts["AWS SubDirs"])
 }
 
 // S3Config struct lets you provide details of the S3 bucket you wish to mount.
@@ -313,6 +320,7 @@ type S3Accessor struct {
 	outCh       chan string
 	outWg       sync.WaitGroup
 	printStdout bool
+	fileCount   int64
 }
 
 // NewS3Accessor creates an S3Accessor for interacting with S3-like object
@@ -341,6 +349,10 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 		if len(parts) >= 1 {
 			basePath = path.Join(parts[1:]...)
 		}
+	}
+
+	if basePath != "" && !strings.HasSuffix(basePath, "/") {
+		basePath += "/"
 	}
 
 	if bucket == "" {
@@ -410,6 +422,7 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 
 			for s := range a.outCh {
 				bw.WriteString(s)
+				atomic.AddInt64(&a.fileCount, 1)
 			}
 
 			bw.Flush()
@@ -422,10 +435,20 @@ func NewS3Accessor(config *S3Config) (*S3Accessor, error) {
 // enqueueOutput sends a pre-formatted string to the background writer.
 func (a *S3Accessor) enqueueOutput(s string) {
 	if !a.printStdout || a.outCh == nil {
+		atomic.AddInt64(&a.fileCount, 1)
+
 		return
 	}
 
 	a.outCh <- s
+}
+
+func (a *S3Accessor) ResetFileCount() {
+	atomic.StoreInt64(&a.fileCount, 0)
+}
+
+func (a *S3Accessor) FileCount() int64 {
+	return atomic.LoadInt64(&a.fileCount)
 }
 
 // printEntry writes a single entry (key, size) to the buffered stdout writer.
@@ -447,6 +470,8 @@ func (a *S3Accessor) Close() {
 		close(a.outCh)
 		a.outWg.Wait()
 	}
+
+	fmt.Fprintf(os.Stderr, "files found: %d\n", a.FileCount())
 }
 
 // ListEntriesMinio recursively lists all entries and their sizes under the
@@ -474,6 +499,58 @@ func (a *S3Accessor) ListEntriesMinio(dir string) error {
 	}
 
 	return nil
+}
+
+// ListEntriesMinioParallelSubDirs lists immediate subdirectories under dir
+// (non-recursive listing) and then lists each subdirectory recursively in
+// parallel. Objects directly under dir are printed synchronously.
+func (a *S3Accessor) ListEntriesMinioParallelSubDirs(dir string) error {
+	ctx := context.Background()
+
+	oiCh := a.minioClient.ListObjects(ctx, a.bucket, minio.ListObjectsOptions{
+		Prefix:    dir,
+		Recursive: false,
+		MaxKeys:   int(maxKeys),
+	})
+
+	var subdirs []string
+	for oi := range oiCh {
+		if oi.Err != nil {
+			fmt.Fprintf(os.Stderr, "err: %v\n", oi.Err)
+			continue
+		}
+
+		// minio-go yields CommonPrefixes as ObjectInfo with only Key populated.
+		// Detect that shape and treat it as a subdirectory.
+		if oi.Key != "" && strings.HasSuffix(oi.Key, "/") && oi.ETag == "" &&
+			oi.LastModified.IsZero() && oi.Size == 0 {
+			subdirs = append(subdirs, oi.Key)
+
+			continue
+		}
+
+		a.printEntry(oi.Key, &oi.Size)
+	}
+
+	return a.parallelize(ctx, subdirs, func(ctx context.Context, sd string) error {
+		oiCh := a.minioClient.ListObjects(ctx, a.bucket, minio.ListObjectsOptions{
+			Prefix:    sd,
+			Recursive: true,
+			MaxKeys:   int(maxKeys),
+		})
+
+		for oi := range oiCh {
+			if oi.Err != nil {
+				fmt.Fprintf(os.Stderr, "err: %v\n", oi.Err)
+
+				continue
+			}
+
+			a.printEntry(oi.Key, &oi.Size)
+		}
+
+		return nil
+	})
 }
 
 // ListEntriesAWS recursively lists all entries and their sizes under the
